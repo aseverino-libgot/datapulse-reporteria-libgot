@@ -1,12 +1,14 @@
 // src/components/submodules/FlujoFinancieroSubmodule.tsx
 import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from 'react';
-import { RefreshCcw, Loader2, AlertCircle, ChevronDown } from 'lucide-react';
+import { RefreshCcw, Loader2, AlertCircle, ChevronDown, ChevronLeft, ChevronRight, Bot, User, Send } from 'lucide-react';
+import ReactMarkdown from 'react-markdown';
 import { Chart, registerables } from 'chart.js';
+import { chatWithData } from '../../services/gemini';
 Chart.register(...registerables);
 import {
   ROWS_AR_REAL, ROWS_AR_PROY, ROWS_CO_REAL, ROWS_CO_PROY,
   parseDailyReal, parseDailyProy, parseProveedoresAr, parseProveedoresCo, parseSheetDate, parseVencimientoEstricto,
-  weeksInMonth, daysInMonth, getKpiPeriodo, fmt, fmtLocal, rcT, formatSheetCell, toDateStr,
+  weeksInMonth, daysInMonth, getKpiPeriodo, sumRangeReal, fmt, fmtLocal, rcT, formatSheetCell, toDateStr,
   type DiaFlujo, type DiaProyeccion, type ProveedorRow, type Pais, type Semana,
 } from './flujoFinancieroHelpers';
 
@@ -85,7 +87,9 @@ interface PaisData {
   proveedores: ProveedorRow[];
 }
 
-export default function FlujoFinancieroSubmodule() {
+const PROV_PAGE_SIZE = 25;
+
+export default function FlujoFinancieroSubmodule({ userEmail }: { userEmail?: string }) {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [dataAr, setDataAr] = useState<PaisData | null>(null);
@@ -106,6 +110,11 @@ export default function FlujoFinancieroSubmodule() {
   const [provTipo, setProvTipo] = useState('');
   const [provMes, setProvMes] = useState('');
   const [provVencExcluidos, setProvVencExcluidos] = useState<Set<string>>(new Set());
+  const [provPage, setProvPage] = useState(0);
+  const [chatMessages, setChatMessages] = useState<{ role: 'user' | 'model'; content: string }[]>([]);
+  const [chatInput, setChatInput] = useState('');
+  const [chatLoading, setChatLoading] = useState(false);
+  const chatScrollRef = useRef<HTMLDivElement>(null);
   const [chartGran, setChartGran] = useState<Vista>('mes');
   const [tablaMetrica, setTablaMetrica] = useState<MetricaDia>('cobranzas');
 
@@ -211,6 +220,18 @@ export default function FlujoFinancieroSubmodule() {
   const hoyStr = useMemo(() => toDateStr(new Date()), []);
   const ocultarRealDia = vista === 'dia' && selDay !== '' && selDay >= hoyStr;
 
+  // Cobranza real del mes en curso: se cuenta solo hasta AYER (el día de hoy todavía no
+  // cerró y los días futuros traen estimaciones cargadas en el sheet). Aplica únicamente
+  // a la tarjeta de Cobranzas de "Totales del Mes" y de "Resumen"; proyectado, gap, ratio
+  // y el resto de los KPIs siguen usando el mes completo.
+  const esMesEnCurso = selYear === new Date().getFullYear() && selMonth === new Date().getMonth();
+  const cobranzaRealMes = useMemo(() => {
+    if (!activo || !kpiMes) return 0;
+    if (!esMesEnCurso) return kpiMes.cobranzas;
+    const ayer = new Date(); ayer.setDate(ayer.getDate() - 1);
+    return sumRangeReal(activo.real, 'cobranzas', rangoMes.start, toDateStr(ayer));
+  }, [activo, kpiMes, esMesEnCurso, rangoMes]);
+
   // Proveedores tiene su propio set de filtros, independiente del selector "Mes" de
   // arriba (que solo gobierna las Filas 1/2, Otros Rubros y el gráfico) — igual que en
   // el HTML original, donde el panel de Proveedores filtraba por sus propios controles.
@@ -291,6 +312,92 @@ export default function FlujoFinancieroSubmodule() {
     }
     return [...vistos.entries()].sort((a, b) => a[0].localeCompare(b[0]));
   }, [proveedoresPais, mesKeyDe]);
+
+  // Resumen y fila de total: siempre sobre TODAS las filas filtradas, no solo la página visible.
+  const provResumen = useMemo(() => {
+    const porEstado = (estado: string) => {
+      const filas = proveedoresFiltrados.filter(p => p.aprobacion === estado);
+      return { facturas: filas.length, importe: filas.reduce((s, p) => s + p.importe, 0) };
+    };
+    return {
+      facturas: proveedoresFiltrados.length,
+      proveedores: new Set(proveedoresFiltrados.map(p => p.nombre.trim().toLowerCase())).size,
+      importe: proveedoresFiltrados.reduce((s, p) => s + p.importe, 0),
+      pagado: porEstado('Si'),
+      pendiente: porEstado('pendiente'),
+    };
+  }, [proveedoresFiltrados]);
+
+  const provTotalPages = Math.max(1, Math.ceil(proveedoresFiltrados.length / PROV_PAGE_SIZE));
+  // Cualquier cambio de filtro (o de país) vuelve a la página 1, para no quedar parado en
+  // una página que ya no existe con el nuevo resultado.
+  useEffect(() => { setProvPage(0); }, [proveedoresFiltrados]);
+  const paginaActual = Math.min(provPage, provTotalPages - 1);
+  const proveedoresPagina = proveedoresFiltrados.slice(paginaActual * PROV_PAGE_SIZE, (paginaActual + 1) * PROV_PAGE_SIZE);
+
+  // ── Chat con los datos ───────────────────────────────────────────────────────
+  // Se le pasa el cashflow diario del año del país activo (real + proyectado por día),
+  // que el digest de gemini.ts agrega por mes. Proveedores va como resumen en los
+  // filtros activos, para no mezclar dos granos distintos en el mismo dataset.
+  const chatRows = useMemo(() => {
+    if (!activo) return [] as Record<string, unknown>[];
+    const proyPorFecha = new Map(activo.proy.map(d => [d.dateStr, d]));
+    return activo.real.map(d => {
+      const p = proyPorFecha.get(d.dateStr);
+      return {
+        fecha: d.dateStr,
+        pais: pais === 'AR' ? 'ARG' : 'COL',
+        moneda: pais === 'AR' ? 'ARS' : 'COP',
+        cobranzas_real: d.cobranzas,
+        cobranzas_proy: p?.cobranzas ?? null,
+        originaciones_real: d.originaciones,
+        originaciones_proy: p?.originaciones ?? null,
+        proveedores_real: d.proveedores,
+        proveedores_proy: p?.proveedores ?? null,
+        impuestos_real: d.impuestos,
+        impuestos_proy: p?.impuestos ?? null,
+        devoluciones_real: d.devoluciones,
+        saldo_inicio: d.saldoInicio,
+        saldo_final: d.saldoFinal,
+      };
+    });
+  }, [activo, pais]);
+
+  useEffect(() => {
+    const el = chatScrollRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
+  }, [chatMessages]);
+
+  const handleSendMessage = async () => {
+    if (!chatInput.trim() || chatLoading || chatRows.length === 0) return;
+    const userMsg = { role: 'user' as const, content: chatInput.trim() };
+    const newMsgs = [...chatMessages, userMsg];
+    setChatMessages(newMsgs);
+    setChatInput('');
+    setChatLoading(true);
+    try {
+      const activeFilters = [
+        { field: 'país', values: [pais === 'AR' ? 'Argentina (ARS)' : 'Colombia (COP)'] },
+        { field: 'año', values: [String(selYear)] },
+        { field: 'mes seleccionado en pantalla', values: [`${MN[selMonth]} ${selYear}`] },
+        { field: 'vista', values: [vista === 'dia' ? `día ${selDay}` : vista === 'semana' ? `semana ${semanas[selWeekIdx]?.label ?? ''}` : 'mes'] },
+        {
+          field: 'resumen proveedores (con los filtros de la tabla)',
+          values: [
+            `${provResumen.facturas} facturas de ${provResumen.proveedores} proveedores, total ${fmtLocal(provResumen.importe, pais)}`,
+            `Pagado: ${provResumen.pagado.facturas} facturas, ${fmtLocal(provResumen.pagado.importe, pais)}`,
+            `Pendiente: ${provResumen.pendiente.facturas} facturas, ${fmtLocal(provResumen.pendiente.importe, pais)}`,
+          ],
+        },
+      ];
+      const reply = await chatWithData(newMsgs, chatRows, activeFilters, userEmail, 'flujo-financiero');
+      setChatMessages([...newMsgs, { role: 'model' as const, content: reply }]);
+    } catch (err: any) {
+      setChatMessages([...newMsgs, { role: 'model' as const, content: `Hubo un error al procesar tu pregunta: ${err.message || err}` }]);
+    } finally {
+      setChatLoading(false);
+    }
+  };
 
   const chartRatioRef = useRef<HTMLCanvasElement>(null);
   const chartRatioInst = useRef<Chart | null>(null);
@@ -445,10 +552,12 @@ export default function FlujoFinancieroSubmodule() {
               <div style={{ flex: 1, height: 1, background: C.border }} />
             </div>
 
-            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit,minmax(150px,1fr))', gap: 12 }}>
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit,minmax(130px,1fr))', gap: 12 }}>
               {([
                 { lbl: 'Saldo Inicio', val: kpiPeriodo.saldoInicio, proy: null, isEgreso: false, exento: true },
-                { lbl: 'Cobranzas', val: kpiPeriodo.cobranzas, proy: kpiPeriodo.proy?.cobranzas ?? null, isEgreso: false, exento: false },
+                { lbl: 'Cobranzas', val: vista === 'mes' ? cobranzaRealMes : kpiPeriodo.cobranzas, proy: kpiPeriodo.proy?.cobranzas ?? null, isEgreso: false, exento: false },
+                // Sin proyección en el sheet: solo el real del período elegido.
+                { lbl: 'Devoluciones', val: kpiPeriodo.devoluciones, proy: null, isEgreso: false, exento: false },
                 { lbl: 'Originaciones', val: -kpiPeriodo.originaciones, proy: kpiPeriodo.proy?.originaciones ?? null, isEgreso: true, exento: false },
                 { lbl: 'Proveedores', val: -kpiPeriodo.proveedores, proy: kpiPeriodo.proy?.proveedores ?? null, isEgreso: true, exento: false },
                 { lbl: 'Impuestos', val: -kpiPeriodo.impuestos, proy: kpiPeriodo.proy?.impuestos ?? null, isEgreso: true, exento: false },
@@ -493,7 +602,7 @@ export default function FlujoFinancieroSubmodule() {
             <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit,minmax(180px,1fr))', gap: 12 }}>
               {([
                 { lbl: 'Ventas', val: kpiMes.originaciones, proy: kpiMes.proy?.originaciones ?? null },
-                { lbl: 'Cobranzas', val: kpiMes.cobranzas, proy: kpiMes.proy?.cobranzas ?? null },
+                { lbl: 'Cobranzas', val: cobranzaRealMes, proy: kpiMes.proy?.cobranzas ?? null },
                 { lbl: 'Proveedores', val: kpiMes.proveedores, proy: kpiMes.proy?.proveedores ?? null },
                 { lbl: 'Impuestos', val: kpiMes.impuestos, proy: kpiMes.proy?.impuestos ?? null },
               ] as const).map(c => (
@@ -595,7 +704,23 @@ export default function FlujoFinancieroSubmodule() {
               <VencimientoFilter info={vencimientoInfo} excluidos={provVencExcluidos} onChange={setProvVencExcluidos} />
             </div>
 
-            <div style={{ ...card, padding: 0, overflowX: 'auto', marginBottom: 32 }}>
+            {/* Resumen de lo filtrado en la tabla de abajo */}
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit,minmax(170px,1fr))', gap: 12, marginBottom: 12 }}>
+              {([
+                { lbl: 'Proveedores', main: provResumen.proveedores.toLocaleString('es-AR'), sub: `${provResumen.facturas.toLocaleString('es-AR')} facturas`, color: C.txt },
+                { lbl: 'Total', main: fmt(provResumen.importe), sub: fmtLocal(provResumen.importe, pais), color: C.txt },
+                { lbl: 'Pagado', main: fmt(provResumen.pagado.importe), sub: `${fmtLocal(provResumen.pagado.importe, pais)} · ${provResumen.pagado.facturas} fact.`, color: C.greenL },
+                { lbl: 'Pendiente', main: fmt(provResumen.pendiente.importe), sub: `${fmtLocal(provResumen.pendiente.importe, pais)} · ${provResumen.pendiente.facturas} fact.`, color: C.amberL },
+              ]).map(c => (
+                <div key={c.lbl} style={{ ...card, padding: '12px 16px' }}>
+                  <div style={{ fontSize: 9.5, fontWeight: 700, color: C.txt2, textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: 7 }}>{c.lbl}</div>
+                  <div style={{ fontSize: 19, fontWeight: 800, letterSpacing: -0.8, ...mono, color: c.color, marginBottom: 4 }}>{c.main}</div>
+                  <div style={{ fontSize: 10.5, ...mono, color: C.txt3 }}>{c.sub}</div>
+                </div>
+              ))}
+            </div>
+
+            <div style={{ ...card, padding: 0, overflowX: 'auto', marginBottom: 10 }}>
               <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 12 }}>
                 <thead>
                   <tr style={{ background: C.bgCard2 }}>
@@ -605,8 +730,8 @@ export default function FlujoFinancieroSubmodule() {
                   </tr>
                 </thead>
                 <tbody>
-                  {proveedoresFiltrados.map((p, i) => (
-                    <tr key={i} style={{ borderBottom: `1px solid ${C.border}` }}>
+                  {proveedoresPagina.map((p, i) => (
+                    <tr key={paginaActual * PROV_PAGE_SIZE + i} style={{ borderBottom: `1px solid ${C.border}` }}>
                       <td style={{ padding: '7px 14px', color: C.txt2 }}>{p.sociedad}</td>
                       <td style={{ padding: '7px 14px', color: C.txt2 }}>{p.detalle}</td>
                       <td style={{ padding: '7px 14px', color: C.txt2 }}>{formatSheetCell(p.mes)}</td>
@@ -625,7 +750,96 @@ export default function FlujoFinancieroSubmodule() {
                     <tr><td colSpan={8} style={{ padding: 24, textAlign: 'center', color: C.txt3 }}>Sin resultados para estos filtros.</td></tr>
                   )}
                 </tbody>
+                {proveedoresFiltrados.length > 0 && (
+                  <tfoot>
+                    <tr style={{ background: C.bgCard2, borderTop: `2px solid ${C.border2}` }}>
+                      <td colSpan={6} style={{ padding: '9px 14px', color: C.txt, fontWeight: 700, fontSize: 11, textTransform: 'uppercase' }}>
+                        Total seleccionado · {provResumen.facturas.toLocaleString('es-AR')} facturas
+                      </td>
+                      <td style={{ padding: '9px 14px', ...mono, color: C.txt, fontWeight: 800 }}>{fmtLocal(provResumen.importe, pais)}</td>
+                      <td />
+                    </tr>
+                  </tfoot>
+                )}
               </table>
+            </div>
+
+            {proveedoresFiltrados.length > PROV_PAGE_SIZE && (
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, marginBottom: 32, fontSize: 11, color: C.txt3, flexWrap: 'wrap' }}>
+                <span>
+                  Mostrando {(paginaActual * PROV_PAGE_SIZE + 1).toLocaleString('es-AR')}–{Math.min((paginaActual + 1) * PROV_PAGE_SIZE, proveedoresFiltrados.length).toLocaleString('es-AR')} de {proveedoresFiltrados.length.toLocaleString('es-AR')}
+                </span>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                  {([
+                    { key: 'first', label: '«', target: 0, disabled: paginaActual === 0 },
+                    { key: 'prev', label: <ChevronLeft size={13} />, target: paginaActual - 1, disabled: paginaActual === 0 },
+                  ]).map(b => (
+                    <button key={b.key} type="button" disabled={b.disabled} onClick={() => setProvPage(b.target)}
+                      style={{ minWidth: 28, height: 28, display: 'flex', alignItems: 'center', justifyContent: 'center', background: C.bgCard2, border: `1px solid ${C.border2}`, borderRadius: 6, color: C.txt2, cursor: b.disabled ? 'default' : 'pointer', opacity: b.disabled ? 0.4 : 1 }}>
+                      {b.label}
+                    </button>
+                  ))}
+                  <span style={{ padding: '0 8px', color: C.txt2 }}>Página {paginaActual + 1} de {provTotalPages}</span>
+                  {([
+                    { key: 'next', label: <ChevronRight size={13} />, target: paginaActual + 1, disabled: paginaActual >= provTotalPages - 1 },
+                    { key: 'last', label: '»', target: provTotalPages - 1, disabled: paginaActual >= provTotalPages - 1 },
+                  ]).map(b => (
+                    <button key={b.key} type="button" disabled={b.disabled} onClick={() => setProvPage(b.target)}
+                      style={{ minWidth: 28, height: 28, display: 'flex', alignItems: 'center', justifyContent: 'center', background: C.bgCard2, border: `1px solid ${C.border2}`, borderRadius: 6, color: C.txt2, cursor: b.disabled ? 'default' : 'pointer', opacity: b.disabled ? 0.4 : 1 }}>
+                      {b.label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
+            {proveedoresFiltrados.length <= PROV_PAGE_SIZE && <div style={{ marginBottom: 32 }} />}
+
+            {/* Chat con los datos */}
+            <div style={{ ...card, display: 'flex', flexDirection: 'column', height: 440, marginBottom: 32 }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '14px 18px', borderBottom: `1px solid ${C.border}`, flexShrink: 0 }}>
+                <Bot size={16} style={{ color: '#a78bfa' }} />
+                <span style={{ fontSize: 13, fontWeight: 700, color: C.txt }}>Chat con los datos</span>
+                <span style={{ fontSize: 10.5, color: C.txt3 }}>· Cashflow {selYear} {pais === 'AR' ? 'Argentina' : 'Colombia'}</span>
+              </div>
+              <div ref={chatScrollRef} style={{ flex: 1, overflowY: 'auto', padding: 16, display: 'flex', flexDirection: 'column', gap: 12, minHeight: 0 }}>
+                {chatMessages.length === 0 ? (
+                  <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: 6, height: '100%', textAlign: 'center' }}>
+                    <Bot size={28} style={{ color: C.txt3 }} />
+                    <p style={{ color: C.txt2, fontSize: 13 }}>Preguntá sobre el flujo financiero.</p>
+                    <p style={{ color: C.txt3, fontSize: 11 }}>Ej: "¿En qué mes la cobranza quedó más lejos de lo proyectado?"</p>
+                  </div>
+                ) : chatMessages.map((msg, i) => (
+                  <div key={i} style={{ display: 'flex', gap: 10, justifyContent: msg.role === 'user' ? 'flex-end' : 'flex-start' }}>
+                    {msg.role === 'model' && <Bot size={18} style={{ color: '#a78bfa', flexShrink: 0, marginTop: 2 }} />}
+                    <div className={msg.role === 'model' ? 'markdown-body prose prose-sm prose-invert max-w-none' : undefined}
+                      style={{ maxWidth: '85%', padding: '8px 12px', borderRadius: 12, fontSize: 12, lineHeight: 1.55, whiteSpace: msg.role === 'user' ? 'pre-wrap' : undefined, background: msg.role === 'user' ? '#2563eb' : C.bgCard2, color: msg.role === 'user' ? '#fff' : C.txt }}>
+                      {msg.role === 'model' ? <ReactMarkdown>{msg.content}</ReactMarkdown> : msg.content}
+                    </div>
+                    {msg.role === 'user' && <User size={18} style={{ color: C.blueL, flexShrink: 0, marginTop: 2 }} />}
+                  </div>
+                ))}
+                {chatLoading && (
+                  <div style={{ display: 'flex', gap: 10 }}>
+                    <Bot size={18} style={{ color: '#a78bfa', flexShrink: 0 }} />
+                    <div style={{ background: C.bgCard2, borderRadius: 12, padding: '8px 12px' }}>
+                      <Loader2 size={14} style={{ color: C.txt2 }} className="animate-spin" />
+                    </div>
+                  </div>
+                )}
+              </div>
+              <div style={{ padding: '12px 16px', borderTop: `1px solid ${C.border}`, display: 'flex', gap: 8, flexShrink: 0 }}>
+                <input type="text" value={chatInput}
+                  onChange={e => setChatInput(e.target.value)}
+                  onKeyDown={e => e.key === 'Enter' && !e.shiftKey && handleSendMessage()}
+                  placeholder="Preguntá sobre cobranzas, originaciones, proveedores..."
+                  disabled={chatRows.length === 0 || chatLoading}
+                  style={{ flex: 1, background: C.bgCard2, border: `1px solid ${C.border2}`, color: C.txt, padding: '8px 12px', borderRadius: 10, fontSize: 12, outline: 'none', opacity: chatRows.length === 0 || chatLoading ? 0.5 : 1 }} />
+                <button type="button" onClick={handleSendMessage}
+                  disabled={!chatInput.trim() || chatLoading || chatRows.length === 0}
+                  style={{ padding: 8, background: '#2563eb', border: 'none', borderRadius: 10, color: '#fff', cursor: 'pointer', display: 'flex', alignItems: 'center', opacity: !chatInput.trim() || chatLoading || chatRows.length === 0 ? 0.4 : 1 }}>
+                  <Send size={15} />
+                </button>
+              </div>
             </div>
           </>
         )}
@@ -779,9 +993,10 @@ function EvolucionDiariaTabla({ real, proy, dias, metrica, pais }: {
         <tbody>
           {dias.map(d => {
             const dt = new Date(d + 'T12:00:00');
-            const r = Math.abs(realPorFecha.get(d)?.[metrica] ?? 0);
-            const p = proyPorFecha.get(d)?.[metrica] ?? null;
-            const pAbs = p !== null ? Math.abs(p) : null;
+            // Ya vienen normalizados a positivo desde los helpers; no se aplica Math.abs
+            // para que una reversa del día (ej. cobranza negativa) se vea como tal.
+            const r = realPorFecha.get(d)?.[metrica] ?? 0;
+            const pAbs = proyPorFecha.get(d)?.[metrica] ?? null;
             const gap = pAbs !== null ? r - pAbs : null;
             const pct = pAbs !== null && pAbs > 0 ? (r / pAbs) * 100 : null;
             return (

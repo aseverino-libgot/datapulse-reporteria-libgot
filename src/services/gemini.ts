@@ -103,6 +103,11 @@ function describeDateColumns(salesData: any[], dateColumns: string[]): Record<st
 
 function toYearMonth(raw: any): string | null {
   if (!raw) return null;
+  // Fecha sin hora ("2026-10-01"): new Date() la toma como medianoche UTC, que en
+  // Argentina/Colombia cae el día anterior — el día 1 de cada mes terminaba sumado al
+  // mes previo. Se toma el año-mes literal del string.
+  const iso = typeof raw === 'string' ? raw.trim().match(/^(\d{4})-(\d{2})(-\d{2})?$/) : null;
+  if (iso) return `${iso[1]}-${iso[2]}`;
   try {
     const d = new Date(raw);
     if (isNaN(d.getTime())) return null;
@@ -385,6 +390,15 @@ REGLAS CRÍTICAS PARA ESTE MÓDULO:
 - "es_costo_estimado" = true significa que ese mes todavía no tenía costos cargados y se replicó/prorrateó el último mes disponible — avisá si el usuario pregunta por un mes reciente que tenga este flag.
 - "es_cohorte_abierta" = true significa que esa cohorte tiene leads con menos de 30 días: sus CPM/CPO/CPV todavía pueden bajar a medida que maduren — es una advertencia, no un error.
 - Ventana de conversión del funnel: 30 días desde la creación del lead.`,
+  'flujo-financiero': `Estás analizando el FLUJO FINANCIERO (cashflow de tesorería) de Anticipo para UN solo país (Argentina en ARS o Colombia en COP, ver filtro "país"). Grano: una fila por día del año. Columnas: fecha, cobranzas_real/_proy, originaciones_real/_proy (desembolsos de préstamos nuevos), proveedores_real/_proy, impuestos_real/_proy, devoluciones_real (sin proyección), saldo_inicio, saldo_final. Todos los montos de flujo están expresados en POSITIVO: cobranzas y devoluciones son lo que ingresó o se devolvió, originaciones/proveedores/impuestos son lo que egresó.
+
+REGLAS CRÍTICAS PARA ESTE MÓDULO:
+- Los totales de un período son la SUMA de los días del período. Los saldos NO se suman: el saldo de un período es saldo_inicio del primer día y saldo_final del último día.
+- Respondé en la moneda local del país (ARS o COP). No conviertas a USD salvo que el usuario lo pida.
+- Ratio Orig/Cob = SUM(originaciones_real) / SUM(cobranzas_real) × 100 del período. Objetivo: menor a 62% en Argentina y menor a 67% en Colombia; a partir de 65% (AR) / 69% (CO) es alerta.
+- Gap = real − proyectado; % de cumplimiento = real / proyectado × 100. Las columnas _proy en null significan que no hay proyección cargada ese día.
+- Días posteriores a hoy pueden traer valores cargados a mano como estimación en el sheet de cashflow; aclaralo si el usuario pregunta por días futuros.
+- El "resumen proveedores" de los filtros describe la tabla de facturas de proveedores con los filtros que el usuario tiene aplicados (Pagado/Pendiente); no está en las filas diarias.`,
 };
 
 function buildDataPrompt(

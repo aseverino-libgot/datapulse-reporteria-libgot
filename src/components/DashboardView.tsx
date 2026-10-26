@@ -1736,7 +1736,7 @@ export default function DashboardView({
           ) : activeSubmodule.id === 'operadores-ventas' ? (
             <OperadoresVentasSubmodule userEmail={userEmail} />
           ) : activeSubmodule.id === 'flujo-financiero' ? (
-            <FlujoFinancieroSubmodule />
+            <FlujoFinancieroSubmodule userEmail={userEmail} />
           ) : activeSubmodule.id === 'catalogo-productos' ? (
             <CatalogoProductosSubmodule />
           ) : (

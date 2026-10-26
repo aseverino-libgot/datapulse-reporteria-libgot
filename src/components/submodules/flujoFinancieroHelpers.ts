@@ -19,6 +19,7 @@ export interface RowMap {
   totalIngFin?: number;
   totalEgrFin?: number;
   freeCashflowFin?: number;
+  devoluciones?: number;
   saldoFinal?: number;
 }
 
@@ -26,7 +27,7 @@ export interface RowMap {
 export const ROWS_AR_REAL: RowMap = {
   fechas: 3, saldoInicio: 4, cobranzas: 10, originaciones: 11, proveedores: 12,
   impuestos: 14, sueldos: 15, gastosBanc: 16, caucion: 20, recuperoColombia: 21,
-  prestamos: 23, devCaucion: 28, saldoFinal: 39,
+  prestamos: 23, devCaucion: 28, devoluciones: 38, saldoFinal: 39,
 };
 
 export const ROWS_AR_PROY: RowMap = {
@@ -36,7 +37,7 @@ export const ROWS_AR_PROY: RowMap = {
 export const ROWS_CO_REAL: RowMap = {
   fechas: 3, saldoInicio: 4, cobranzas: 17, originaciones: 18, proveedores: 19,
   tarjetas: 20, impuestos: 21, sueldos: 22, gastosBanc: 23,
-  totalIngFin: 31, totalEgrFin: 38, freeCashflowFin: 40, saldoFinal: 42,
+  totalIngFin: 31, totalEgrFin: 38, freeCashflowFin: 40, devoluciones: 41, saldoFinal: 42,
 };
 
 export const ROWS_CO_PROY: RowMap = {
@@ -135,8 +136,19 @@ export interface DiaFlujo {
   totalIngFin: number;
   totalEgrFin: number;
   freeCashflowFin: number;
+  devoluciones: number;
   saldoFinal: number;
 }
+
+// Cobranzas (ingreso, positivo en el sheet) y Proveedores/Impuestos (egresos, negativos
+// en el sheet) se suman CON signo y recién después se expresan en positivo: un día
+// con una reversa (cobranza negativa, o un egreso positivo por un reintegro) tiene que
+// RESTAR del total del período, igual que en la columna "Total <mes>" del sheet. Antes
+// se aplicaba Math.abs por día, que convertía esas reversas en montos extra.
+const ingreso = (rows: string[][], rowIdx: number | undefined, col: number): number =>
+  rowIdx === undefined ? 0 : parseSheetNum(rows[rowIdx]?.[col] ?? '');
+const egreso = (rows: string[][], rowIdx: number | undefined, col: number): number =>
+  rowIdx === undefined ? 0 : -parseSheetNum(rows[rowIdx]?.[col] ?? '');
 
 export function parseDailyReal(rows: string[][], map: RowMap, originacionesPorDia: Record<string, number>, anio: number): DiaFlujo[] {
   const dateRow = rows[map.fechas] || [];
@@ -153,10 +165,10 @@ export function parseDailyReal(rows: string[][], map: RowMap, originacionesPorDi
     out.push({
       dateStr, month: date.getMonth(), day: date.getDate(),
       saldoInicio: getSigned(map.saldoInicio, c),
-      cobranzas: get(map.cobranzas, c),
+      cobranzas: ingreso(rows, map.cobranzas, c),
       originaciones: originacionesPorDia[dateStr] ?? 0,
-      proveedores: get(map.proveedores, c),
-      impuestos: get(map.impuestos, c),
+      proveedores: egreso(rows, map.proveedores, c),
+      impuestos: egreso(rows, map.impuestos, c),
       sueldos: get(map.sueldos, c),
       gastosBanc: get(map.gastosBanc, c),
       caucion: get(map.caucion, c),
@@ -167,6 +179,7 @@ export function parseDailyReal(rows: string[][], map: RowMap, originacionesPorDi
       totalIngFin: get(map.totalIngFin, c),
       totalEgrFin: get(map.totalEgrFin, c),
       freeCashflowFin: getSigned(map.freeCashflowFin, c),
+      devoluciones: get(map.devoluciones, c),
       saldoFinal: getSigned(map.saldoFinal, c),
     });
   }
@@ -183,8 +196,6 @@ export interface DiaProyeccion {
 
 export function parseDailyProy(rows: string[][], map: RowMap, anio: number): DiaProyeccion[] {
   const dateRow = rows[map.fechas] || [];
-  const get = (rowIdx: number | undefined, col: number): number =>
-    rowIdx === undefined ? 0 : Math.abs(parseSheetNum(rows[rowIdx]?.[col] ?? ''));
 
   const out: DiaProyeccion[] = [];
   for (let c = 1; c < dateRow.length; c++) {
@@ -192,10 +203,10 @@ export function parseDailyProy(rows: string[][], map: RowMap, anio: number): Dia
     if (!date || date.getFullYear() !== anio) continue;
     out.push({
       dateStr: toDateStr(date),
-      cobranzas: get(map.cobranzas, c),
-      originaciones: get(map.originaciones, c),
-      proveedores: get(map.proveedores, c),
-      impuestos: get(map.impuestos, c),
+      cobranzas: ingreso(rows, map.cobranzas, c),
+      originaciones: egreso(rows, map.originaciones, c),
+      proveedores: egreso(rows, map.proveedores, c),
+      impuestos: egreso(rows, map.impuestos, c),
     });
   }
   return out;
@@ -236,6 +247,7 @@ export interface KpiPeriodo {
   originaciones: number;
   proveedores: number;
   impuestos: number;
+  devoluciones: number;
   saldoFinal: number;
   ratio: number;
   proy: { cobranzas: number; originaciones: number; proveedores: number; impuestos: number; ratio: number } | null;
@@ -248,6 +260,7 @@ export function getKpiPeriodo(diasReal: DiaFlujo[], diasProy: DiaProyeccion[], s
   const originaciones = sumRangeReal(diasReal, 'originaciones', start, end);
   const proveedores = sumRangeReal(diasReal, 'proveedores', start, end);
   const impuestos = sumRangeReal(diasReal, 'impuestos', start, end);
+  const devoluciones = sumRangeReal(diasReal, 'devoluciones', start, end);
   const saldoInicio = valorEnDia(diasReal, 'saldoInicio', start);
   const saldoFinal = valorEnDia(diasReal, 'saldoFinal', end);
   const ratio = cobranzas > 0 ? (originaciones / cobranzas) * 100 : 0;
@@ -257,7 +270,7 @@ export function getKpiPeriodo(diasReal: DiaFlujo[], diasProy: DiaProyeccion[], s
   const pOriginaciones = sumRangeProy(diasProy, 'originaciones', start, end);
 
   return {
-    saldoInicio, cobranzas, originaciones, proveedores, impuestos, saldoFinal, ratio,
+    saldoInicio, cobranzas, originaciones, proveedores, impuestos, devoluciones, saldoFinal, ratio,
     proy: hayProy ? {
       cobranzas: pCobranzas,
       originaciones: pOriginaciones,
