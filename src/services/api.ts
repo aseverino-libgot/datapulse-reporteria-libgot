@@ -246,3 +246,38 @@ async function requestConversionRenovadores(pais: string, meses: number, refresh
 
 export const fetchConversionRenovadores = (pais: string, meses: number) => requestConversionRenovadores(pais, meses, false);
 export const refreshConversionRenovadores = (pais: string, meses: number) => requestConversionRenovadores(pais, meses, true);
+
+// ── Callcenter · Upgrade de oferta ──────────────────────────────────────────────
+export interface UpgradeOfertaRangoPais {
+  inicio_datos: string;  // primer día con datos de upgrade del país
+  corte: string;         // D-1 local del país
+  desde: string | null;  // rango efectivo consultado (null si no cubre datos del país)
+  hasta: string | null;
+}
+
+export interface UpgradeOfertaResponse {
+  desde: string;
+  hasta: string;
+  paises: { ARG: UpgradeOfertaRangoPais; COL: UpgradeOfertaRangoPais };
+  filas: any[]; // FilaUpgrade (ver upgradeOfertaHelpers.ts)
+  cached_at: string;
+  from_cache: boolean;
+}
+
+/** desde/hasta opcionales ('YYYY-MM-DD', inclusive). Sin ellos: desde el inicio de datos hasta D-1. */
+async function requestUpgradeOferta(refresh: boolean, desde?: string, hasta?: string): Promise<UpgradeOfertaResponse> {
+  const params = new URLSearchParams();
+  if (desde) params.set('desde', desde);
+  if (hasta) params.set('hasta', hasta);
+  const qs = params.toString();
+  const url = `/api/callcenter/upgrade-oferta${refresh ? '/refresh' : ''}${qs ? `?${qs}` : ''}`;
+  const response = await fetch(url, { method: refresh ? 'POST' : 'GET', headers: { 'accept': 'application/json' } });
+  if (!response.ok) {
+    const errorData = await response.json().catch(() => ({}));
+    throw new Error(errorData.details || errorData.error || `HTTP ${response.status}`);
+  }
+  return response.json();
+}
+
+export const fetchUpgradeOferta = (desde?: string, hasta?: string) => requestUpgradeOferta(false, desde, hasta);
+export const refreshUpgradeOferta = (desde?: string, hasta?: string) => requestUpgradeOferta(true, desde, hasta);
