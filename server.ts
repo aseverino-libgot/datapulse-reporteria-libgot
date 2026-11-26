@@ -17,6 +17,10 @@ import {
   runConversionRenovadores, parsePais, parseMeses, ParamError,
   type PaisConversion, type ResultadoConversion,
 } from './server/conversionRenovadoresQuery';
+import {
+  runUpgradeOferta, parseRango as parseRangoUpgrade, hoyPorPais as hoyPorPaisUpgrade,
+  ParamError as UpgradeParamError, type ResultadoUpgradeOferta,
+} from './server/upgradeOfertaQuery';
 
 dotenv.config();
 
@@ -1591,6 +1595,63 @@ async function startServer() {
 
   app.get('/api/board/conversion-renovadores', handleConversionRenovadores(false));
   app.post('/api/board/conversion-renovadores/refresh', handleConversionRenovadores(true));
+
+  // ── Callcenter · Upgrade de oferta ──────────────────────────────────────────────
+  // server/upgradeOfertaQuery.ts. Datos a D-1 local por país → la clave incluye el "hoy" local de ARG y COL,
+  // así la caché se invalida sola al cambiar el día. Caché 24h, llamadas concurrentes comparten una sola query.
+  const UPGRADE_OFERTA_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
+  const UPGRADE_OFERTA_MIN_REFRESH_MS = 60 * 1000; // /refresh no relanza la query si el dato tiene < 1 min
+  const upgradeOfertaCache = new Map<string, { data: ResultadoUpgradeOferta; fetchedAt: number }>();
+  const upgradeOfertaInflight = new Map<string, Promise<ResultadoUpgradeOferta>>();
+
+  async function getUpgradeOferta(pool: Pool, desdeRaw: unknown, hastaRaw: unknown, force = false) {
+    const hoy = hoyPorPaisUpgrade();
+    const rango = parseRangoUpgrade(desdeRaw, hastaRaw, hoy); // lanza UpgradeParamError → 400
+    const key = `${rango.desde}|${rango.hasta}|${hoy.ARG}|${hoy.COL}`;
+    for (const [k, v] of upgradeOfertaCache) { // limpia entradas vencidas (rangos viejos o de días anteriores)
+      if (Date.now() - v.fetchedAt > UPGRADE_OFERTA_CACHE_TTL_MS || !k.endsWith(`|${hoy.ARG}|${hoy.COL}`)) upgradeOfertaCache.delete(k);
+    }
+    const cached = upgradeOfertaCache.get(key);
+    const age = cached ? Date.now() - cached.fetchedAt : Infinity;
+    const limite = force ? UPGRADE_OFERTA_MIN_REFRESH_MS : UPGRADE_OFERTA_CACHE_TTL_MS;
+    if (cached && age <= limite) {
+      return { data: cached.data, fetchedAt: cached.fetchedAt, fromCache: true };
+    }
+    let pending = upgradeOfertaInflight.get(key);
+    if (!pending) {
+      const t0 = Date.now();
+      pending = runUpgradeOferta(pool, rango, hoy)
+        .then(data => {
+          upgradeOfertaCache.set(key, { data, fetchedAt: Date.now() });
+          console.log(`[UpgradeOferta] ${key}: ${data.filas.length} filas en ${Date.now() - t0} ms`);
+          return data;
+        })
+        .finally(() => upgradeOfertaInflight.delete(key));
+      upgradeOfertaInflight.set(key, pending);
+    }
+    const data = await pending;
+    return { data, fetchedAt: upgradeOfertaCache.get(key)?.fetchedAt ?? Date.now(), fromCache: false };
+  }
+
+  const handleUpgradeOferta = (force: boolean) => async (req: express.Request, res: express.Response) => {
+    if (!redshiftPool) {
+      return res.status(503).json({
+        error: 'Conexión a Redshift no configurada',
+        required_env: ['REDSHIFT_HOST', 'REDSHIFT_DATABASE', 'REDSHIFT_USER', 'REDSHIFT_PASSWORD'],
+      });
+    }
+    try {
+      const { data, fetchedAt, fromCache } = await getUpgradeOferta(redshiftPool, req.query.desde, req.query.hasta, force);
+      res.json({ ...data, cached_at: new Date(fetchedAt).toISOString(), from_cache: fromCache });
+    } catch (error: any) {
+      if (error instanceof UpgradeParamError) return res.status(400).json({ error: error.message });
+      console.error('[UpgradeOferta] Error consultando Redshift:', error);
+      res.status(500).json({ error: 'Error al calcular el upgrade de oferta', details: error.message });
+    }
+  };
+
+  app.get('/api/callcenter/upgrade-oferta', handleUpgradeOferta(false));
+  app.post('/api/callcenter/upgrade-oferta/refresh', handleUpgradeOferta(true));
 
   app.patch("/api/uif/audit", async (req, res) => {
     const body = req.body as {

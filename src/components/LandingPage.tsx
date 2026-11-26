@@ -246,6 +246,12 @@ const modules = [
         title: 'Buscador de Pagos',
         description: 'Consulta de pagos por CUIL (Argentina) o Cédula (Colombia) sobre la base de cobranzas.',
         color: 'bg-indigo-800'
+      },
+      {
+        id: 'callcenter-upgrade-oferta',
+        title: 'Upgrade de oferta',
+        description: 'Uso del upgrade de oferta por país y día: ofertas con upgrade disponible, tomados y tope inicial vs. ajustado.',
+        color: 'bg-indigo-800'
       }
     ]
   },
