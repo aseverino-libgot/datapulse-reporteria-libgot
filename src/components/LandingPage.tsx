@@ -2,6 +2,7 @@ import React, { useRef, useMemo, useEffect } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
 import { QRCodeSVG } from 'qrcode.react';
 import { PowerBIButton, ContactGrid } from './ContactSection';
+import VersionBadge from './VersionBadge';
 import {
   TrendingUp,
   Wallet,
@@ -945,7 +946,7 @@ export default function LandingPage({ onSelectModule, onOpenTerms, onOpenFeature
         <div className="absolute bottom-0 left-0 w-96 h-96 bg-indigo-600/5 blur-[120px] -ml-48 -mb-48" />
       </motion.div>
 
-      <footer className="mt-8 pt-12 border-t border-slate-800/50 flex flex-col gap-12">
+      <footer className="mt-8 pt-12 pb-12 border-t border-slate-800/50 flex flex-col gap-12">
         <PowerBIButton />
 
         <div className="flex flex-col lg:flex-row items-center justify-between gap-8">
@@ -974,8 +975,11 @@ export default function LandingPage({ onSelectModule, onOpenTerms, onOpenFeature
 
         <ContactGrid />
 
-        <div className="text-center text-zinc-500 text-[10px] font-bold uppercase tracking-[0.2em] pb-12 border-t border-slate-900/50 pt-8">
-          © 2026 Business Intelligence Suite · Insights estratégicos para decisiones inteligentes
+        <div>
+          <div className="text-center text-zinc-500 text-[10px] font-bold uppercase tracking-[0.2em] border-t border-slate-900/50 pt-8">
+            © 2026 Business Intelligence Suite · Insights estratégicos para decisiones inteligentes
+          </div>
+          <VersionBadge />
         </div>
       </footer>
 
