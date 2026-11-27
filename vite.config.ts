@@ -1,6 +1,5 @@
 import tailwindcss from '@tailwindcss/vite';
 import react from '@vitejs/plugin-react';
-import { execSync } from 'child_process';
 import { readFileSync } from 'fs';
 import path from 'path';
 import { defineConfig } from 'vite';
@@ -19,27 +18,10 @@ const buildDate = new Intl.DateTimeFormat('es-AR', {
   year: 'numeric',
 }).format(new Date());
 
-// Código corto del commit (7 caracteres). Nunca rompe el build:
-// 1) variable de entorno COMMIT_SHA, 2) git, 3) "sin-commit".
-function getCommitSha(): string {
-  const fromEnv = process.env.COMMIT_SHA?.trim();
-  if (fromEnv) return fromEnv.slice(0, 7);
-  try {
-    return execSync('git rev-parse --short=7 HEAD', {
-      stdio: ['ignore', 'pipe', 'ignore'], // silencia los errores de git
-    })
-      .toString()
-      .trim();
-  } catch {
-    return 'sin-commit';
-  }
-}
-
 export default defineConfig({
   define: {
     __APP_VERSION__: JSON.stringify(appVersion),
     __BUILD_DATE__: JSON.stringify(buildDate),
-    __COMMIT_SHA__: JSON.stringify(getCommitSha()),
   },
   plugins: [react(), tailwindcss()],
   resolve: {
