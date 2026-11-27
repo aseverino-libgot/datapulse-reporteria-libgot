@@ -281,3 +281,54 @@ async function requestUpgradeOferta(refresh: boolean, desde?: string, hasta?: st
 
 export const fetchUpgradeOferta = (desde?: string, hasta?: string) => requestUpgradeOferta(false, desde, hasta);
 export const refreshUpgradeOferta = (desde?: string, hasta?: string) => requestUpgradeOferta(true, desde, hasta);
+
+// ── Callcenter · Aging de ofertas ───────────────────────────────────────────────
+export interface AgingConciliacion {
+  ventas_vista: number;
+  ventas_tabla_oficial: number;
+  ventas_sin_oferta: number;
+}
+
+export interface AgingOfertasResponse {
+  mes: string;                  // 'YYYY-MM'
+  mes_ini: string;              // 'YYYY-MM-DD'
+  mes_fin: string;
+  filas: any[];                 // FilaAging (ver agingOfertasHelpers.ts)
+  conciliacion: { ARG: AgingConciliacion; COL: AgingConciliacion };
+  meses_disponibles: string[];  // meses cerrados, del más reciente al más antiguo
+  ultimo_mes_cerrado: string;
+  cached_at: string;            // fecha de consulta al DWH
+  from_cache: boolean;
+}
+
+export interface AgingNoVendidosResponse {
+  mes: string;
+  pais: string;
+  consultado_at: string;
+  excluidos_venta_posterior: number; // no vendidos del mes que compraron después del cierre: fuera del archivo
+  filas: any[];                 // FilaNoVendido (ver agingOfertasHelpers.ts): solo los que siguen sin comprar
+}
+
+async function leerJson<T>(response: Response): Promise<T> {
+  if (!response.ok) {
+    const errorData = await response.json().catch(() => ({}));
+    throw new Error(errorData.error || `HTTP ${response.status}`);
+  }
+  return response.json();
+}
+
+/** mes opcional ('YYYY-MM'). Sin él, el servidor usa el último mes cerrado. */
+async function requestAgingOfertas(refresh: boolean, mes?: string): Promise<AgingOfertasResponse> {
+  const qs = mes ? `?${new URLSearchParams({ mes })}` : '';
+  const url = `/api/callcenter/aging-ofertas${refresh ? '/refresh' : ''}${qs}`;
+  return leerJson(await fetch(url, { method: refresh ? 'POST' : 'GET', headers: { 'accept': 'application/json' } }));
+}
+
+export const fetchAgingOfertas = (mes?: string) => requestAgingOfertas(false, mes);
+export const refreshAgingOfertas = (mes?: string) => requestAgingOfertas(true, mes);
+
+/** Renovadores no vendidos del mes y país (datos a nivel lead, para el export a Excel). */
+export async function fetchAgingNoVendidos(mes: string, pais: string): Promise<AgingNoVendidosResponse> {
+  const url = `/api/callcenter/aging-ofertas/no-vendidos?${new URLSearchParams({ mes, pais })}`;
+  return leerJson(await fetch(url, { headers: { 'accept': 'application/json' } }));
+}

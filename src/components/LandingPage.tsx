@@ -252,6 +252,12 @@ const modules = [
         title: 'Upgrade de oferta',
         description: 'Uso del upgrade de oferta por país y día: ofertas con upgrade disponible, tomados y tope inicial vs. ajustado.',
         color: 'bg-indigo-800'
+      },
+      {
+        id: 'callcenter-aging-ofertas',
+        title: 'Aging de ofertas',
+        description: 'Conversión de renovadores por antigüedad de la oferta en meses cerrados (ARG/COL) y export de no vendidos.',
+        color: 'bg-indigo-800'
       }
     ]
   },

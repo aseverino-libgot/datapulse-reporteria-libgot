@@ -21,6 +21,11 @@ import {
   runUpgradeOferta, parseRango as parseRangoUpgrade, hoyPorPais as hoyPorPaisUpgrade,
   ParamError as UpgradeParamError, type ResultadoUpgradeOferta,
 } from './server/upgradeOfertaQuery';
+import {
+  runAgingOfertas, runNoVendidos, ultimoMesCerrado as ultimoMesCerradoAging,
+  mesesDisponibles as mesesDisponiblesAging, parseMes as parseMesAging, parsePais as parsePaisAging,
+  ParamError as AgingParamError, type ResultadoAgingOfertas,
+} from './server/agingOfertasQuery';
 
 dotenv.config();
 
@@ -1652,6 +1657,94 @@ async function startServer() {
 
   app.get('/api/callcenter/upgrade-oferta', handleUpgradeOferta(false));
   app.post('/api/callcenter/upgrade-oferta/refresh', handleUpgradeOferta(true));
+
+  // ── Callcenter · Aging de ofertas ───────────────────────────────────────────────
+  // server/agingOfertasQuery.ts. Solo meses cerrados → caché 24 h por mes. La clave incluye el último mes cerrado,
+  // así al pasar de mes se limpian las entradas viejas. Llamadas concurrentes comparten una sola query.
+  // El export de no vendidos (datos a nivel lead) no se cachea y en el log va solo la cantidad de filas.
+  const AGING_OFERTAS_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
+  const AGING_OFERTAS_MIN_REFRESH_MS = 60 * 1000; // /refresh no relanza la query si el dato tiene < 1 min
+  const agingOfertasCache = new Map<string, { data: ResultadoAgingOfertas; fetchedAt: number }>();
+  const agingOfertasInflight = new Map<string, Promise<ResultadoAgingOfertas>>();
+
+  async function getAgingOfertas(pool: Pool, mes: string, ultimo: string, force = false) {
+    const key = `${mes}|${ultimo}`;
+    for (const [k, v] of agingOfertasCache) { // limpia entradas vencidas o de un "último mes cerrado" anterior
+      if (Date.now() - v.fetchedAt > AGING_OFERTAS_CACHE_TTL_MS || !k.endsWith(`|${ultimo}`)) agingOfertasCache.delete(k);
+    }
+    const cached = agingOfertasCache.get(key);
+    const age = cached ? Date.now() - cached.fetchedAt : Infinity;
+    const limite = force ? AGING_OFERTAS_MIN_REFRESH_MS : AGING_OFERTAS_CACHE_TTL_MS;
+    if (cached && age <= limite) {
+      return { data: cached.data, fetchedAt: cached.fetchedAt, fromCache: true };
+    }
+    let pending = agingOfertasInflight.get(key);
+    if (!pending) {
+      const t0 = Date.now();
+      pending = runAgingOfertas(pool, mes)
+        .then(data => {
+          agingOfertasCache.set(key, { data, fetchedAt: Date.now() });
+          console.log(`[AgingOfertas] ${mes}: ${data.filas.length} filas agregadas en ${Date.now() - t0} ms`);
+          return data;
+        })
+        .finally(() => agingOfertasInflight.delete(key));
+      agingOfertasInflight.set(key, pending);
+    }
+    const data = await pending;
+    return { data, fetchedAt: agingOfertasCache.get(key)?.fetchedAt ?? Date.now(), fromCache: false };
+  }
+
+  const handleAgingOfertas = (force: boolean) => async (req: express.Request, res: express.Response) => {
+    if (!redshiftPool) {
+      return res.status(503).json({
+        error: 'Conexión a Redshift no configurada',
+        required_env: ['REDSHIFT_HOST', 'REDSHIFT_DATABASE', 'REDSHIFT_USER', 'REDSHIFT_PASSWORD'],
+      });
+    }
+    try {
+      const ultimo = ultimoMesCerradoAging();
+      const mes = parseMesAging(req.query.mes, ultimo); // vacío = último mes cerrado; inválido → AgingParamError → 400
+      const { data, fetchedAt, fromCache } = await getAgingOfertas(redshiftPool, mes, ultimo, force);
+      res.json({
+        ...data,
+        meses_disponibles: mesesDisponiblesAging(ultimo),
+        ultimo_mes_cerrado: ultimo,
+        cached_at: new Date(fetchedAt).toISOString(), // fecha de consulta al DWH (se muestra en pantalla)
+        from_cache: fromCache,
+      });
+    } catch (error: any) {
+      if (error instanceof AgingParamError) return res.status(400).json({ error: error.message });
+      console.error('[AgingOfertas] Error consultando Redshift:', error?.message);
+      res.status(500).json({ error: 'Error al calcular el aging de ofertas' });
+    }
+  };
+
+  app.get('/api/callcenter/aging-ofertas', handleAgingOfertas(false));
+  app.post('/api/callcenter/aging-ofertas/refresh', handleAgingOfertas(true));
+
+  // Export de renovadores no vendidos del mes y país. mes y pais obligatorios. Sin caché (datos a nivel lead).
+  app.get('/api/callcenter/aging-ofertas/no-vendidos', async (req, res) => {
+    if (!redshiftPool) {
+      return res.status(503).json({
+        error: 'Conexión a Redshift no configurada',
+        required_env: ['REDSHIFT_HOST', 'REDSHIFT_DATABASE', 'REDSHIFT_USER', 'REDSHIFT_PASSWORD'],
+      });
+    }
+    try {
+      if (!req.query.mes) throw new AgingParamError('mes es obligatorio (YYYY-MM)');
+      const mes = parseMesAging(req.query.mes, ultimoMesCerradoAging());
+      const pais = parsePaisAging(req.query.pais);
+      const t0 = Date.now();
+      const { filas, excluidos_venta_posterior } = await runNoVendidos(redshiftPool, mes, pais);
+      console.log(`[AgingOfertas] export no vendidos ${pais} ${mes}: ${filas.length} filas, ${excluidos_venta_posterior} excluidos por venta posterior, en ${Date.now() - t0} ms`);
+      res.set('Cache-Control', 'no-store');
+      res.json({ mes, pais, consultado_at: new Date().toISOString(), excluidos_venta_posterior, filas });
+    } catch (error: any) {
+      if (error instanceof AgingParamError) return res.status(400).json({ error: error.message });
+      console.error('[AgingOfertas] Error en export de no vendidos:', error?.message);
+      res.status(500).json({ error: 'Error al generar el export de no vendidos' });
+    }
+  });
 
   app.patch("/api/uif/audit", async (req, res) => {
     const body = req.body as {
