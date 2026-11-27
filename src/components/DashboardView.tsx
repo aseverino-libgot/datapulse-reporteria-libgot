@@ -55,6 +55,7 @@ import CallcenterUpgradeOfertaSubmodule from './submodules/CallcenterUpgradeOfer
 import CallcenterAgingOfertasSubmodule from './submodules/CallcenterAgingOfertasSubmodule';
 import MarketingFunnelCharts from './MarketingFunnelCharts';
 import PageLoader from './PageLoader';
+import VersionBadge from './VersionBadge';
 
 function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
@@ -2175,8 +2176,11 @@ export default function DashboardView({
 
         <ContactGrid />
 
-        <div className="text-center text-zinc-500 text-[10px] font-bold uppercase tracking-[0.2em] pt-8 border-t border-slate-900/50">
-          © 2026 Business Intelligence Suite - Punta de lanza tecnológica
+        <div>
+          <div className="text-center text-zinc-500 text-[10px] font-bold uppercase tracking-[0.2em] pt-8 border-t border-slate-900/50">
+            © 2026 Business Intelligence Suite - Punta de lanza tecnológica
+          </div>
+          <VersionBadge />
         </div>
       </footer>
     </div>
